@@ -184,11 +184,16 @@ from cqlshlib.formatting import (DEFAULT_DATE_FORMAT, DEFAULT_NANOTIME_FORMAT,
 from cqlshlib.tracing import print_trace, print_trace_session
 from cqlshlib.util import get_file_encoding_bomsize, trim_if_present
 
+from cqlshlib.sigv4auth import SignatureV4AuthProvider
+
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 9042
 DEFAULT_SSL = False
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
+
+DEFAULT_AWS_SIG_V4_AUTH = False
+DEFAULT_SESSION_DURATION_SECONDS = 3600
 
 DEFAULT_FLOAT_PRECISION = 5
 DEFAULT_DOUBLE_PRECISION = 5
@@ -243,6 +248,14 @@ parser.add_option("--request-timeout", default=DEFAULT_REQUEST_TIMEOUT_SECONDS, 
                   help='Specify the default request timeout in seconds (default: %default seconds).')
 parser.add_option("-t", "--tty", action='store_true', dest='tty',
                   help='Force tty mode (command prompt).')
+
+parser.add_option("--aws-sig-v4-auth", action='store_true', default=DEFAULT_AWS_SIG_V4_AUTH,
+                  help='Use AWS Keyspace Signature V4 authentication.')
+parser.add_option("--role-arn", dest='role_arn', help='Role to use for AWS.')
+parser.add_option("--role-session-name", dest='role_session_name', help='Session name to use for AWS.')
+parser.add_option("--session-duration", default=DEFAULT_SESSION_DURATION_SECONDS, dest='session_duration',
+                  help='Session duration for AWS role ARN (default: %default seconds).')
+parser.add_option("--auth-profile", dest='auth_profile', help='Authentication profile for AWS from configuration file.')
 
 optvalues = optparse.Values()
 (options, arguments) = parser.parse_args(sys.argv[1:], values=optvalues)
@@ -454,15 +467,33 @@ class Shell(cmd.Cmd):
                  request_timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS,
                  protocol_version=None,
                  connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS,
-                 is_subshell=False):
+                 is_subshell=False,
+                 aws_sig_v4_auth=DEFAULT_AWS_SIG_V4_AUTH,
+                 role_arn=None,
+                 role_session_name=None,
+                 session_duration=DEFAULT_SESSION_DURATION_SECONDS,
+                 auth_profile=None):
         cmd.Cmd.__init__(self, completekey=completekey)
         self.hostname = hostname
         self.port = port
-        self.auth_provider = None
-        if username:
+        self.aws_sig_v4_auth = aws_sig_v4_auth
+        self.role_arn = role_arn
+        self.role_session_name = role_session_name
+        self.session_duration = session_duration
+        self.auth_profile = auth_profile
+        if aws_sig_v4_auth:
+            # Amazon Keyspaces service endpoint is in the format cassandra.us-east-1.amazonaws.com
+            region = hostname.split('.')[1]
+            self.auth_provider = SignatureV4AuthProvider(region_name=region, role_arn=role_arn,
+                                                         role_session_name=role_session_name,
+                                                         session_duration_seconds=session_duration,
+                                                         profile_name=auth_profile)
+        elif username:
             if not password:
                 password = getpass.getpass()
             self.auth_provider = PlainTextAuthProvider(username=username, password=password)
+        else:
+            self.auth_provider = None
         self.username = username
         self.keyspace = keyspace
         self.ssl = ssl
@@ -1647,8 +1678,8 @@ class Shell(cmd.Cmd):
         except IOError as e:
             self.printerr('Could not open %r: %s' % (fname, e))
             return
-        username = self.auth_provider.username if self.auth_provider else None
-        password = self.auth_provider.password if self.auth_provider else None
+        username = self.auth_provider.username if not self.aws_sig_v4_auth and self.auth_provider else None
+        password = self.auth_provider.password if not self.aws_sig_v4_auth and self.auth_provider else None
         subshell = Shell(self.hostname, self.port, color=self.color,
                          username=username, password=password,
                          encoding=self.encoding, stdin=f, tty=False, use_conn=self.conn,
@@ -1663,7 +1694,12 @@ class Shell(cmd.Cmd):
                          max_trace_wait=self.max_trace_wait, ssl=self.ssl,
                          request_timeout=self.session.default_timeout,
                          connect_timeout=self.conn.connect_timeout,
-                         is_subshell=True)
+                         is_subshell=True,
+                         aws_sig_v4_auth=self.aws_sig_v4_auth,
+                         role_arn=self.role_arn,
+                         role_session_name=self.role_session_name,
+                         session_duration=self.session_duration,
+                         auth_profile=self.auth_profile)
         # duplicate coverage related settings in subshell
         if self.coverage:
             subshell.coverage = True
@@ -2125,6 +2161,13 @@ def read_options(cmdlineargs, environment):
     optvalues.username = option_with_default(configs.get, 'authentication', 'username')
     optvalues.password = option_with_default(rawconfigs.get, 'authentication', 'password')
     optvalues.keyspace = option_with_default(configs.get, 'authentication', 'keyspace')
+    optvalues.aws_sig_v4_auth = option_with_default(configs.getboolean, 'authentication', 'aws_sig_v4_auth',
+                                                    DEFAULT_AWS_SIG_V4_AUTH)
+    optvalues.role_arn = option_with_default(configs.get, 'authentication', 'role_arn')
+    optvalues.role_session_name = option_with_default(configs.get, 'authentication', 'role_session_name')
+    optvalues.session_duration = option_with_default(configs.getint, 'connection', 'session_duration',
+                                                     DEFAULT_SESSION_DURATION_SECONDS)
+    optvalues.auth_profile = option_with_default(configs.get, 'authentication', 'auth_profile')
     optvalues.browser = option_with_default(configs.get, 'ui', 'browser', None)
     optvalues.completekey = option_with_default(configs.get, 'ui', 'completekey',
                                                 DEFAULT_COMPLETEKEY)
@@ -2330,7 +2373,12 @@ def main(options, hostname, port):
                       single_statement=options.execute,
                       request_timeout=options.request_timeout,
                       connect_timeout=options.connect_timeout,
-                      encoding=options.encoding)
+                      encoding=options.encoding,
+                      aws_sig_v4_auth=options.aws_sig_v4_auth,
+                      role_arn=options.role_arn,
+                      role_session_name=options.role_session_name,
+                      session_duration=options.session_duration,
+                      auth_profile=options.auth_profile)
     except KeyboardInterrupt:
         sys.exit('Connection aborted.')
     except CQL_ERRORS as e:

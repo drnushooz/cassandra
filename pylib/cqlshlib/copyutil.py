@@ -499,7 +499,12 @@ class CopyTask(object):
                     protocol_version=self.protocol_version,
                     debug=shell.debug,
                     coverage=shell.coverage,
-                    coveragerc_path=shell.coveragerc_path
+                    coveragerc_path=shell.coveragerc_path,
+                    aws_sig_v4_auth=shell.aws_sig_v4_auth,
+                    role_arn=shell.role_arn,
+                    role_session_name=shell.role_session_name,
+                    session_duration=shell.session_duration,
+                    auth_profile=shell.auth_profile,
                     )
 
     def validate_columns(self):
@@ -1412,6 +1417,12 @@ class ChildProcess(mp.Process):
         self.ssl = params['ssl']
         self.protocol_version = params['protocol_version']
         self.config_file = params['config_file']
+
+        self.aws_sig_v4_auth = params['aws_sig_v4_auth']
+        self.role_arn = params['role_arn']
+        self.role_session_name = params['role_session_name']
+        self.session_duration = params['session_duration']
+        self.auth_profile = params['auth_profile']
 
         options = params['options']
         self.date_time_format = options.copy['dtformats']
